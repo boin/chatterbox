@@ -125,6 +125,29 @@ class ChatterboxTTS:
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
 
+    def cleanup(self):
+        """
+        Clean up resources to prevent memory leaks.
+        """
+        # Clean up any alignment analyzers if they exist
+        if hasattr(self.t3, 'patched_model') and self.t3.patched_model is not None:
+            if hasattr(self.t3.patched_model, 'alignment_stream_analyzer') and \
+               self.t3.patched_model.alignment_stream_analyzer is not None:
+                self.t3.patched_model.alignment_stream_analyzer.cleanup()
+        
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    def __del__(self):
+        """
+        Destructor to ensure cleanup when object is deleted.
+        """
+        try:
+            self.cleanup()
+        except:
+            pass  # Ignore errors during cleanup
+
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
         ckpt_dir = Path(ckpt_dir)
@@ -242,31 +265,43 @@ class ChatterboxTTS:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-        with torch.inference_mode():
-            speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
+        try:
+            with torch.inference_mode():
+                speech_tokens = self.t3.inference(
+                    t3_cond=self.conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=1000,  # TODO: use the value in config
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                )
+                # Extract only the conditional batch.
+                speech_tokens = speech_tokens[0]
 
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
-            
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+                # TODO: output becomes 1D
+                speech_tokens = drop_invalid_tokens(speech_tokens)
+                
+                speech_tokens = speech_tokens[speech_tokens < 6561]
 
-            speech_tokens = speech_tokens.to(self.device)
+                speech_tokens = speech_tokens.to(self.device)
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=self.conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                
+                # Clean up intermediate tensors
+                del speech_tokens
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        except Exception as e:
+            # Clean up on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise e

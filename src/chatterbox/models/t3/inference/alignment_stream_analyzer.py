@@ -54,7 +54,14 @@ class AlignmentStreamAnalyzer:
         # using it for all layers slows things down too much. We can apply it to just one layer
         # by intercepting the kwargs and adding a forward hook (credit: jrm)
         self.last_aligned_attn = None
+        self.hook_handle = None
+        self.original_forward = None
+        self.target_layer = None
         self._add_attention_spy(tfmr, alignment_layer_idx)
+        
+        # Memory management settings
+        self.max_alignment_length = 10000  # Prevent unlimited growth
+        self.cleanup_frequency = 100  # Clean up every N frames
 
     def _add_attention_spy(self, tfmr, alignment_layer_idx):
         """
@@ -72,26 +79,85 @@ class AlignmentStreamAnalyzer:
             - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
             """
             step_attention = output[1].cpu() # (B, 16, N, N)
+            # Clear old attention data to prevent accumulation
+            if self.last_aligned_attn is not None:
+                del self.last_aligned_attn
             self.last_aligned_attn = step_attention[0].mean(0) # (N, N)
 
-        target_layer = tfmr.layers[alignment_layer_idx].self_attn
-        hook_handle = target_layer.register_forward_hook(attention_forward_hook)
+        self.target_layer = tfmr.layers[alignment_layer_idx].self_attn
+        self.hook_handle = self.target_layer.register_forward_hook(attention_forward_hook)
 
         # Backup original forward
-        original_forward = target_layer.forward
+        self.original_forward = self.target_layer.forward
         def patched_forward(self, *args, **kwargs):
             kwargs['output_attentions'] = True
-            return original_forward(*args, **kwargs)
+            return self.original_forward(*args, **kwargs)
 
-        # TODO: how to unpatch it?
-        target_layer.forward = MethodType(patched_forward, target_layer)
+        # Store reference to restore later
+        self.target_layer.forward = MethodType(patched_forward, self.target_layer)
+
+    def cleanup(self):
+        """
+        Clean up hooks and restore original forward method to prevent memory leaks.
+        """
+        if self.hook_handle is not None:
+            self.hook_handle.remove()
+            self.hook_handle = None
+        
+        if self.target_layer is not None and self.original_forward is not None:
+            self.target_layer.forward = self.original_forward
+            self.original_forward = None
+            self.target_layer = None
+        
+        # Clear accumulated data
+        if self.last_aligned_attn is not None:
+            del self.last_aligned_attn
+            self.last_aligned_attn = None
+        
+        # Clear alignment history beyond reasonable bounds
+        if self.alignment.size(0) > self.max_alignment_length:
+            # Keep only the most recent data
+            keep_length = self.max_alignment_length // 2
+            self.alignment = self.alignment[-keep_length:].clone()
+            if self.started_at is not None:
+                self.started_at = max(0, self.started_at - (self.alignment.size(0) - keep_length))
+            if self.completed_at is not None:
+                self.completed_at = max(0, self.completed_at - (self.alignment.size(0) - keep_length))
+
+    def _manage_memory(self):
+        """
+        Periodically clean up memory to prevent unlimited growth.
+        """
+        if self.curr_frame_pos % self.cleanup_frequency == 0:
+            if self.alignment.size(0) > self.max_alignment_length:
+                # Keep only the most recent data
+                keep_length = self.max_alignment_length // 2
+                self.alignment = self.alignment[-keep_length:].clone()
+                # Adjust tracking variables
+                if self.started_at is not None:
+                    self.started_at = max(0, self.started_at - (self.alignment.size(0) - keep_length))
+                if self.completed_at is not None:
+                    self.completed_at = max(0, self.completed_at - (self.alignment.size(0) - keep_length))
+                # Force garbage collection
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def step(self, logits):
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
+        # Manage memory periodically
+        self._manage_memory()
+        
         # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
         aligned_attn = self.last_aligned_attn # (N, N)
+        if aligned_attn is None:
+            # If no attention data available, return logits unchanged
+            self.curr_frame_pos += 1
+            return logits
+            
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
             # first chunk has conditioning info, text tokens, and BOS token

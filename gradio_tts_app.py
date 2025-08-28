@@ -28,17 +28,28 @@ def generate(model, text, audio_prompt_path, exaggeration, temperature, seed_num
     if seed_num != 0:
         set_seed(int(seed_num))
 
-    wav = model.generate(
-        text,
-        audio_prompt_path=audio_prompt_path,
-        exaggeration=exaggeration,
-        temperature=temperature,
-        cfg_weight=cfgw,
-        min_p=min_p,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-    )
-    return (model.sr, wav.squeeze(0).numpy())
+    try:
+        wav = model.generate(
+            text,
+            audio_prompt_path=audio_prompt_path,
+            exaggeration=exaggeration,
+            temperature=temperature,
+            cfg_weight=cfgw,
+            min_p=min_p,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+        
+        # Clear CUDA cache after generation to prevent memory accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return (model.sr, wav.squeeze(0).numpy())
+    except Exception as e:
+        # If an error occurs, clear CUDA cache before re-raising
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise e
 
 
 with gr.Blocks() as demo:

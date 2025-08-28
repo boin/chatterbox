@@ -128,21 +128,26 @@ class AlignmentStreamAnalyzer:
         """
         Periodically clean up memory to prevent unlimited growth.
         """
+        # Check memory limits more frequently than cleanup_frequency
+        if self.alignment.size(0) > self.max_alignment_length:
+            # Keep only the most recent data
+            keep_length = self.max_alignment_length // 2
+            old_size = self.alignment.size(0)
+            self.alignment = self.alignment[-keep_length:].clone()
+            # Adjust tracking variables
+            reduction = old_size - keep_length
+            if self.started_at is not None:
+                self.started_at = max(0, self.started_at - reduction)
+            if self.completed_at is not None:
+                self.completed_at = max(0, self.completed_at - reduction)
+        
+        # Full cleanup including garbage collection at intervals
         if self.curr_frame_pos % self.cleanup_frequency == 0:
-            if self.alignment.size(0) > self.max_alignment_length:
-                # Keep only the most recent data
-                keep_length = self.max_alignment_length // 2
-                self.alignment = self.alignment[-keep_length:].clone()
-                # Adjust tracking variables
-                if self.started_at is not None:
-                    self.started_at = max(0, self.started_at - (self.alignment.size(0) - keep_length))
-                if self.completed_at is not None:
-                    self.completed_at = max(0, self.completed_at - (self.alignment.size(0) - keep_length))
-                # Force garbage collection
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Force garbage collection
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def step(self, logits):
         """
